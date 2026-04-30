@@ -306,6 +306,8 @@ mi_decl_export void* mi_arena_area(mi_arena_id_t arena_id, size_t* size);
 mi_decl_export int   mi_reserve_huge_os_pages_at_ex(size_t pages, int numa_node, size_t timeout_msecs, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
 mi_decl_export int   mi_reserve_os_memory_ex(size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
 mi_decl_export bool  mi_manage_os_memory_ex(void* start, size_t size, bool is_committed, bool is_large, bool is_zero, int numa_node, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
+mi_decl_export bool  mi_manage_os_memory_shared(void* shm_base, size_t shm_size, mi_arena_id_t* arena_id) mi_attr_noexcept;
+mi_decl_export bool  mi_manage_os_memory_shared_disjoint(void* meta_base, size_t meta_size, void* data_base, size_t data_size, mi_arena_id_t* arena_id) mi_attr_noexcept;
 
 #if MI_MALLOC_VERSION >= 182
 // Create a heap that only allocates in the specified arena

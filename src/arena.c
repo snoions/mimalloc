@@ -20,6 +20,7 @@ The arena allocation needs to be thread safe and we use an atomic bitmap to allo
 -----------------------------------------------------------------------------*/
 
 #include "mimalloc.h"
+#include "mimalloc/cxl.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "bitmap.h"
@@ -80,6 +81,10 @@ static mi_arena_id_t mi_arena_id_create(size_t arena_index) {
   mi_assert_internal(arena_index < MI_MAX_ARENAS);
   return (int)arena_index + 1;
 }
+
+#define MI_IN_ARENA_C
+#include "arena-cxl.c"
+#undef MI_IN_ARENA_C
 
 mi_arena_id_t _mi_arena_id_none(void) {
   return 0;
