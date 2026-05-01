@@ -82,10 +82,6 @@ static mi_arena_id_t mi_arena_id_create(size_t arena_index) {
   return (int)arena_index + 1;
 }
 
-#define MI_IN_ARENA_C
-#include "arena-cxl.c"
-#undef MI_IN_ARENA_C
-
 mi_arena_id_t _mi_arena_id_none(void) {
   return 0;
 }
@@ -1048,3 +1044,7 @@ int mi_reserve_huge_os_pages(size_t pages, double max_secs, size_t* pages_reserv
   if (err==0 && pages_reserved!=NULL) *pages_reserved = pages;
   return err;
 }
+
+#define MI_IN_ARENA_C
+#include "arena-cxl.c"
+#undef MI_IN_ARENA_C

@@ -4,434 +4,474 @@
  *
  * MUST be #include-d from the BOTTOM of src/arena.c (after all static
  * function definitions), not compiled as a separate translation unit.
+
+ * ============================================================
+ * Shared-memory layout (both co-located and disjoint)
+ * ============================================================
  *
- * Integration:
- *   1. cp arena-cxl.c   mimalloc/src/
- *   2. cp cxl.h         mimalloc/include/mimalloc/
- *   3. In src/arena.c:
- *        a) Near the top, after other #includes:
- *             #include "mimalloc/cxl.h"
- *        b) At the very bottom of the file:
- *             #define MI_IN_ARENA_C
- *             #include "arena-cxl.c"
- *             #undef MI_IN_ARENA_C
- *   4. In include/mimalloc.h, after mi_manage_os_memory_ex:
- *        mi_decl_export size_t mi_cxl_meta_region_size(size_t data_size) mi_attr_noexcept;
- *        mi_decl_export bool   mi_manage_os_memory_shared(void* shm_base, size_t shm_size, mi_arena_id_t* arena_id) mi_attr_noexcept;
- *        mi_decl_export bool   mi_manage_os_memory_shared_disjoint(void* meta_base, size_t meta_size, void* data_base, size_t data_size, mi_arena_id_t* arena_id) mi_attr_noexcept;
+ * The meta region contains:
+ *
+ *   [0]                     mi_cxl_shm_header_t
+ *   [sizeof(hdr)]           mi_arena_t
+ *   [sizeof(hdr)
+ *    + sizeof(mi_arena_t)]  bitmap arrays, laid out exactly as in
+ *                           mi_manage_os_memory_ex2:
+ *
+ *     &arena->blocks_inuse[0]            blocks_inuse  [0..fields-1]
+ *     &arena->blocks_inuse[fields]       blocks_dirty  [0..fields-1]
+ *     &arena->blocks_inuse[2*fields]     blocks_abandoned [0..fields-1]
+ *     blocks_committed = NULL   (pinned memory — always committed)
+ *     blocks_purge     = NULL   (pinned memory — never purged)
+ *
+ * Total bitmap storage = 3 * fields * sizeof(mi_bitmap_field_t)
+ * (blocks_inuse[0] is embedded in mi_arena_t; [1..fields-1] are overflow)
+ *
+ * For co-located layout, the meta region is rounded up to MI_ARENA_BLOCK_SIZE
+ * so that allocation blocks start on a block-aligned boundary.
+ * For disjoint layout, the meta region is not rounded (data_base alignment
+ * is the caller's concern).
  */
- 
+
 #ifndef MI_IN_ARENA_C
 #error "arena-cxl.c must be #include-d from arena.c, not compiled directly"
 #endif
- 
+
 /* ============================================================
-   Internal layout helpers
-   ============================================================
- 
-   Co-located layout (mi_manage_os_memory_shared):
- 
-     meta_base == shm_base:
-       [0 .. sizeof(hdr))                  mi_cxl_shm_header_t
-       [sizeof(hdr) .. sizeof(hdr)+meta)   mi_arena_t + bitmap overflow
-                                           + blocks_dirty + blocks_abandoned
-       [header_size .. header_size+blocks) allocation blocks
-       header_size = align_up(sizeof(hdr)+meta, MI_ARENA_BLOCK_SIZE)
- 
-   Disjoint layout (mi_manage_os_memory_shared_disjoint):
- 
-     meta_base (e.g. a slice of HWcc memory):
-       [0 .. sizeof(hdr))                  mi_cxl_shm_header_t
-       [sizeof(hdr) .. sizeof(hdr)+meta)   mi_arena_t + bitmap overflow
-                                           + blocks_dirty + blocks_abandoned
-       header_size = sizeof(hdr) + meta    (NOT block-rounded)
- 
-     data_base (e.g. SWcc memory):
-       [0 .. block_count * MI_ARENA_BLOCK_SIZE)   allocation blocks
-*/
- 
-/* Bytes for the arena struct plus its bitmap storage.
+   Layout helpers — canonical pattern from mi_manage_os_memory_ex2
+   ============================================================ */
+
+/* Bytes for the arena struct plus its 3 bitmap arrays (pinned memory).
  *
- * In v3.2.8, blocks_inuse is mi_bitmap_field_t blocks_inuse[1] embedded
- * at the END of mi_arena_t (verified: offsetof=184, sizeof=192).
- * arena->blocks_inuse[0] is already inside the struct; indices [1..field_count-1]
- * extend immediately past sizeof(mi_arena_t) as overflow words.
+ * Matches: asize = sizeof(mi_arena_t) + (bitmaps * fields * sizeof(field))
+ * where bitmaps = 3 for pinned (inuse, dirty, abandoned).
+ * blocks_committed and blocks_purge are NULL for pinned CXL memory.
  *
- * blocks_committed, blocks_purge, blocks_dirty, blocks_abandoned are plain
- * mi_bitmap_field_t* pointers stored earlier in the struct; their arrays
- * follow the inuse overflow in the meta region.
- *
- * Total extra storage = (field_count-1) inuse overflow
- *                     + 4 * field_count for the four pointer-based arrays
- *                     = 5*field_count - 1 words
+ * blocks_inuse[0] is embedded in mi_arena_t; [1..fields-1] are overflow
+ * words immediately following the struct — this is the same flexible-array
+ * pattern used throughout arena.c.
  */
-static size_t mi_cxl_arena_meta_size(size_t field_count) {
-  const size_t overflow = (field_count > 0) ? (field_count - 1) : 0;
-  return sizeof(mi_arena_t)
-       + overflow    * sizeof(mi_bitmap_field_t)  /* blocks_inuse overflow */
-       + field_count * sizeof(mi_bitmap_field_t)  /* blocks_committed      */
-       + field_count * sizeof(mi_bitmap_field_t)  /* blocks_purge          */
-       + field_count * sizeof(mi_bitmap_field_t)  /* blocks_dirty          */
-       + field_count * sizeof(mi_bitmap_field_t); /* blocks_abandoned      */
+static size_t mi_cxl_arena_meta_size(size_t fields) {
+  return sizeof(mi_arena_t) + 3 * fields * sizeof(mi_bitmap_field_t);
 }
- 
-/* Total bytes consumed in the metadata region.
- * For co-located: rounded up to MI_ARENA_BLOCK_SIZE so blocks are aligned.
- * For disjoint:   not rounded (data_base alignment is the caller's concern). */
-static size_t mi_cxl_header_size_colocated(size_t field_count) {
-  return _mi_align_up(
-      sizeof(mi_cxl_shm_header_t) + mi_cxl_arena_meta_size(field_count),
-      MI_ARENA_BLOCK_SIZE);
+
+/* Total bytes consumed in the meta region.
+ * Co-located: rounded up to MI_ARENA_BLOCK_SIZE (blocks must be aligned).
+ * Disjoint:   not rounded (data_base alignment is caller's responsibility). */
+static size_t mi_cxl_header_size_colocated(size_t fields) {
+  return _mi_align_up(sizeof(mi_cxl_shm_header_t) + mi_cxl_arena_meta_size(fields),
+                      MI_ARENA_BLOCK_SIZE);
 }
- 
-static size_t mi_cxl_header_size_disjoint(size_t field_count) {
-  return sizeof(mi_cxl_shm_header_t) + mi_cxl_arena_meta_size(field_count);
+
+static size_t mi_cxl_header_size_disjoint(size_t fields) {
+  return sizeof(mi_cxl_shm_header_t) + mi_cxl_arena_meta_size(fields);
 }
- 
+
 /* ============================================================
    Public sizing helper
    ============================================================ */
- 
+
 size_t mi_cxl_meta_region_size(size_t data_size) {
-  /* Assume worst-case: data_base is 1 byte past a block boundary, so we
-   * lose up to (MI_ARENA_BLOCK_SIZE - 1) bytes to alignment.  Callers
-   * don't need to know their data_base when computing the meta size.       */
-  const size_t worst_case = data_size > MI_ARENA_BLOCK_SIZE
-                              ? data_size - MI_ARENA_BLOCK_SIZE : 0;
-  const size_t block_count = worst_case / MI_ARENA_BLOCK_SIZE;
-  const size_t field_count = (block_count > 0)
-      ? _mi_divide_up(block_count, MI_BITMAP_FIELD_BITS) : 1;
-  return _mi_align_up(mi_cxl_header_size_disjoint(field_count), 64);
+  /* Worst-case: data_base is 1 byte past a MI_SEGMENT_ALIGN boundary,
+   * losing up to (MI_SEGMENT_ALIGN - 1) bytes to alignment.               */
+  const size_t worst = (data_size > MI_SEGMENT_ALIGN)
+                         ? data_size - MI_SEGMENT_ALIGN : 0;
+  const size_t bcount = worst / MI_ARENA_BLOCK_SIZE;
+  const size_t fields = (bcount > 0) ? _mi_divide_up(bcount, MI_BITMAP_FIELD_BITS) : 1;
+  /* Align to cache line so carved slices don't false-share. */
+  return _mi_align_up(mi_cxl_header_size_disjoint(fields), 64);
 }
- 
+
 /* ============================================================
-   Co-located layout computation (two-pass, shared region)
+   Layout computation
    ============================================================ */
- 
+
+/* Align data_base up to MI_SEGMENT_ALIGN (matching mi_manage_os_memory_ex2
+ * which aligns start to MI_SEGMENT_ALIGN, not MI_ARENA_BLOCK_SIZE).        */
+static uintptr_t mi_cxl_align_data(uintptr_t data_base_addr) {
+  return _mi_align_up(data_base_addr, MI_SEGMENT_ALIGN);
+}
+
 static bool mi_cxl_compute_layout_colocated(size_t  shm_size,
-                                              size_t* out_block_count,
-                                              size_t* out_field_count,
+                                              size_t* out_bcount,
+                                              size_t* out_fields,
                                               size_t* out_hdr_size)
 {
-  /* Pass 1: upper-bound from total size */
-  size_t block_count = shm_size / MI_ARENA_BLOCK_SIZE;
-  if (block_count < 2) return false;
-  size_t field_count = _mi_divide_up(block_count, MI_BITMAP_FIELD_BITS);
-  size_t hdr_size    = mi_cxl_header_size_colocated(field_count);
+  /* Pass 1: upper bound */
+  size_t bcount = shm_size / MI_ARENA_BLOCK_SIZE;
+  if (bcount < 2) return false;
+  size_t fields   = _mi_divide_up(bcount, MI_BITMAP_FIELD_BITS);
+  size_t hdr_size = mi_cxl_header_size_colocated(fields);
   if (hdr_size >= shm_size) return false;
- 
-  /* Pass 2: recompute with actual data area */
-  block_count = (shm_size - hdr_size) / MI_ARENA_BLOCK_SIZE;
-  if (block_count == 0) return false;
-  field_count = _mi_divide_up(block_count, MI_BITMAP_FIELD_BITS);
-  hdr_size    = mi_cxl_header_size_colocated(field_count);
+
+  /* Pass 2: recompute with actual data size */
+  bcount   = (shm_size - hdr_size) / MI_ARENA_BLOCK_SIZE;
+  if (bcount == 0) return false;
+  fields   = _mi_divide_up(bcount, MI_BITMAP_FIELD_BITS);
+  hdr_size = mi_cxl_header_size_colocated(fields);
   if (hdr_size >= shm_size) return false;
- 
-  *out_block_count = block_count;
-  *out_field_count = field_count;
-  *out_hdr_size    = hdr_size;
+
+  *out_bcount   = bcount;
+  *out_fields   = fields;
+  *out_hdr_size = hdr_size;
   return true;
 }
- 
-/* ============================================================
-   Disjoint layout computation (single-pass, separate regions)
-   ============================================================ */
- 
-static bool mi_cxl_compute_layout_disjoint(size_t  meta_size,
-                                             size_t  data_size,
+
+static bool mi_cxl_compute_layout_disjoint(size_t    meta_size,
+                                             size_t    data_size,
                                              uintptr_t data_base_addr,
-                                             size_t* out_block_count,
-                                             size_t* out_field_count,
-                                             size_t* out_hdr_size)
+                                             size_t*   out_bcount,
+                                             size_t*   out_fields,
+                                             size_t*   out_hdr_size)
 {
-  /* Skip any partial block at the base of the data region so that
-   * arena->start is always block-aligned.                                   */
-  const uintptr_t aligned = _mi_align_up(data_base_addr, MI_ARENA_BLOCK_SIZE);
-  if (aligned >= data_base_addr + data_size) return false; /* no room at all */
-  const size_t effective_size = data_size - (aligned - data_base_addr);
- 
-  const size_t block_count = effective_size / MI_ARENA_BLOCK_SIZE;
-  if (block_count == 0) return false;
-  const size_t field_count = _mi_divide_up(block_count, MI_BITMAP_FIELD_BITS);
-  const size_t hdr_size    = mi_cxl_header_size_disjoint(field_count);
+  const uintptr_t aligned = mi_cxl_align_data(data_base_addr);
+  if (aligned >= data_base_addr + data_size) return false;
+  const size_t effective = data_size - (aligned - data_base_addr);
+
+  const size_t bcount   = effective / MI_ARENA_BLOCK_SIZE;
+  if (bcount == 0) return false;
+  const size_t fields   = _mi_divide_up(bcount, MI_BITMAP_FIELD_BITS);
+  const size_t hdr_size = mi_cxl_header_size_disjoint(fields);
   if (hdr_size > meta_size) return false;
- 
-  *out_block_count = block_count;
-  *out_field_count = field_count;
-  *out_hdr_size    = hdr_size;
+
+  *out_bcount   = bcount;
+  *out_fields   = fields;
+  *out_hdr_size = hdr_size;
   return true;
 }
- 
-/* ============================================================
-   Process-local arena table registration
-   ============================================================ */
- 
-static bool mi_cxl_arena_register(mi_arena_t*    arena,
-                                   size_t         required_slot,
-                                   mi_arena_id_t* arena_id)
-{
-  if (mi_unlikely(required_slot >= MI_MAX_ARENAS)) {
-    _mi_error_message(ENOMEM,
-      "cxl-arena: required slot %zu >= MI_MAX_ARENAS (%d)\n"
-      "  Call mi_manage_os_memory_shared*() before any other arena creation.\n",
-      required_slot, MI_MAX_ARENAS);
-    return false;
-  }
- 
-  if (mi_unlikely(
-        mi_atomic_load_ptr_acquire(mi_arena_t, &mi_arenas[required_slot]) != NULL))
-  {
-    _mi_error_message(EINVAL,
-      "cxl-arena: slot %zu is already occupied.\n"
-      "  Call mi_manage_os_memory_shared*() before any other arena creation.\n",
-      required_slot);
-    return false;
-  }
- 
-  size_t current = mi_atomic_load_relaxed(&mi_arena_count);
-  while (current <= required_slot) {
-    if (mi_atomic_cas_strong_acq_rel(&mi_arena_count, &current, required_slot + 1))
-      break;
-  }
- 
-  mi_atomic_store_ptr_release(mi_arena_t, &mi_arenas[required_slot], arena);
-  *arena_id = mi_arena_id_create(required_slot);
-  return true;
-}
- 
+
 /* ============================================================
    Shared internal implementation
-   ============================================================
-   meta_base / meta_size : region that holds the header + arena + bitmaps
-   data_base / data_size : region that holds the allocation blocks
-   block_count, field_count, hdr_size: pre-computed by the caller
-*/
- 
+   ============================================================ */
+
 static bool mi_cxl_init_shared(void*  meta_base, size_t meta_size,
                                 void*  data_base, size_t data_size,
-                                size_t block_count,
-                                size_t field_count,
-                                size_t hdr_size,
+                                size_t bcount, size_t fields, size_t hdr_size,
                                 mi_arena_id_t* arena_id)
 {
-  (void)meta_size; /* checked by caller; not needed further */
- 
-  uint8_t* const base     = (uint8_t*)meta_base;
+  (void)meta_size;
+
+  uint8_t*             const base    = (uint8_t*)meta_base;
   mi_cxl_shm_header_t* const shm_hdr = (mi_cxl_shm_header_t*)base;
   mi_arena_t*          const arena   =
       (mi_arena_t*)(base + sizeof(mi_cxl_shm_header_t));
- 
-  /* Bitmap layout immediately after the struct:
-   *
-   *   [sizeof(mi_arena_t)]
-   *   blocks_inuse[1..field_count-1]   overflow words  (field_count-1 words)
-   *   blocks_committed[0..field_count-1]               (field_count words)
-   *   blocks_purge    [0..field_count-1]               (field_count words)
-   *   blocks_dirty    [0..field_count-1]               (field_count words)
-   *   blocks_abandoned[0..field_count-1]               (field_count words)
-   *
-   * blocks_inuse[0] is already embedded in the struct at offset 184.
-   * Do NOT assign arena->blocks_inuse — it is an array type, not a pointer.
-   */
-  const size_t inuse_overflow = (field_count > 0) ? (field_count - 1) : 0;
-  mi_bitmap_field_t* const after_struct =
-      (mi_bitmap_field_t*)((uint8_t*)arena + sizeof(mi_arena_t));
-  mi_bitmap_field_t* const p_committed = after_struct + inuse_overflow;
-  mi_bitmap_field_t* const p_purge     = p_committed + field_count;
-  mi_bitmap_field_t* const p_dirty     = p_purge     + field_count;
-  mi_bitmap_field_t* const p_abandoned = p_dirty     + field_count;
- 
-  /* Align the data start up to a full arena block boundary.
-   * data_base may not be block-aligned if the mapped region has metadata
-   * (e.g. system metadata) at its base.  We skip the partial first block
-   * rather than letting mimalloc write segment headers into live metadata.
-   * block_count was already computed from the aligned view by
-   * mi_cxl_compute_layout_disjoint, so no adjustment is needed there.     */
+
+  /* Data start: align up to MI_SEGMENT_ALIGN, matching mi_manage_os_memory_ex2. */
   uint8_t* const data_start =
-      (uint8_t*)_mi_align_up((uintptr_t)data_base, MI_ARENA_BLOCK_SIZE);
- 
+      (uint8_t*)mi_cxl_align_data((uintptr_t)data_base);
+
   /* ================================================================
-     Election: CAS on magic to elect exactly one first-initialiser.
+     Election: CAS elects exactly one first-initialiser.
      ================================================================ */
   uint64_t expected_zero = 0;
   const bool i_am_first  =
       mi_atomic_cas_strong_acq_rel(&shm_hdr->magic,
                                    &expected_zero,
                                    MI_CXL_SHM_MAGIC_INIT);
- 
+
   if (i_am_first) {
     /* ------------------------------------------------------------------
-       FIRST PROCESS: zero header, populate arena struct, publish.
+       FIRST PROCESS: matches mi_manage_os_memory_ex2 field-for-field,
+       then uses mi_arena_add() exactly as the canonical path does.
        ------------------------------------------------------------------ */
     _mi_memzero(base, hdr_size);
- 
-    mi_atomic_store_ptr_release(uint8_t, &arena->start, data_start);
- 
-    arena->block_count = block_count;
-    arena->field_count = field_count;
-    arena->meta_size   = mi_cxl_arena_meta_size(field_count);
-    arena->meta_memid  = _mi_memid_create(MI_MEM_STATIC);
-    arena->numa_node   = -1;
-    arena->exclusive   = true;
-    arena->is_large    = true;  /* pinned; disables commit/decommit paths */
- 
-    mi_lock_init(&arena->abandoned_visit_lock);
-    mi_atomic_store_relaxed(&arena->search_idx, (size_t)0);
-    mi_atomic_store_relaxed(&arena->purge_expire, (mi_msecs_t)INT64_MAX);
- 
-    /* blocks_inuse: do not assign — embedded array, already at &arena->blocks_inuse[0].
-     * Overflow words [1..field_count-1] are zeroed by the _mi_memzero above. */
-    arena->blocks_committed = p_committed;
-    arena->blocks_purge     = p_purge;
-    arena->blocks_dirty     = p_dirty;
-    arena->blocks_abandoned = p_abandoned;
- 
-    arena->memid                     = _mi_memid_create(MI_MEM_STATIC);
+
+    arena->id      = _mi_arena_id_none();
+    arena->memid   = _mi_memid_create(MI_MEM_STATIC);
     arena->memid.initially_committed = true;
     arena->memid.initially_zero      = true;
     arena->memid.is_pinned           = true;
- 
-    const size_t my_slot = mi_atomic_load_relaxed(&mi_arena_count);
-    arena->id = mi_arena_id_create(my_slot);
- 
-    // and claim leftover blocks if needed (so we never allocate there)
-    ptrdiff_t post = (field_count * MI_BITMAP_FIELD_BITS) - block_count;
+
+    arena->exclusive    = false;
+    arena->is_large     = true;
+    arena->numa_node    = -1;
+    arena->block_count  = bcount;
+    arena->field_count  = fields;
+    arena->meta_size    = mi_cxl_arena_meta_size(fields);
+    arena->meta_memid   = _mi_memid_create(MI_MEM_STATIC);
+
+    arena->start        = data_start;
+    arena->purge_expire = 0;
+    arena->search_idx   = 0;
+    mi_lock_init(&arena->abandoned_visit_lock);
+
+    arena->blocks_dirty     = &arena->blocks_inuse[fields];
+    arena->blocks_abandoned = &arena->blocks_inuse[2 * fields];
+    arena->blocks_committed = NULL;  /* pinned: always committed, no tracking */
+    arena->blocks_purge     = NULL;  /* pinned: never purged                  */
+    ptrdiff_t post = (ptrdiff_t)(fields * MI_BITMAP_FIELD_BITS) - (ptrdiff_t)bcount;
     mi_assert_internal(post >= 0);
     if (post > 0) {
-      // don't use leftover bits at the end
-      mi_bitmap_index_t postidx = mi_bitmap_index_create(field_count - 1, MI_BITMAP_FIELD_BITS - post);
-      _mi_bitmap_claim(arena->blocks_inuse, field_count, post, postidx, NULL);
+      mi_bitmap_index_t postidx = mi_bitmap_index_create(fields - 1,
+                                      MI_BITMAP_FIELD_BITS - (size_t)post);
+      _mi_bitmap_claim(arena->blocks_inuse, fields, (size_t)post, postidx, NULL);
     }
 
-    if (!mi_cxl_arena_register(arena, my_slot, arena_id)) {
+    /* Use mi_arena_add — same function the canonical path calls.
+     * It atomically claims a slot, sets arena->id, updates stats,
+     * and stores the pointer into mi_arenas[].                            */
+    if (!mi_arena_add(arena, arena_id, &_mi_stats_main)) {
       mi_atomic_store_release(&shm_hdr->magic, UINT64_C(0));
       return false;
     }
- 
-    /* Fill header fields — all must be written before publishing magic. */
-    shm_hdr->header_size = hdr_size;
-    shm_hdr->block_count = block_count;
-    shm_hdr->field_count = field_count;
-    shm_hdr->meta_va     = (uintptr_t)meta_base;
-    shm_hdr->data_va     = (uintptr_t)data_base;
-    shm_hdr->data_size   = data_size;
- 
-    /* PUBLISH */
-    mi_atomic_store_release(&shm_hdr->magic, MI_CXL_SHM_MAGIC);
- 
+    /* arena->id is now set by mi_arena_add; publish it before magic so
+     * attaching processes can read it after their acquire load.           */
+
+    shm_hdr->header_size        = hdr_size;
+    shm_hdr->block_count        = bcount;
+    shm_hdr->field_count        = fields;
+    shm_hdr->meta_va            = (uintptr_t)meta_base;
+    shm_hdr->data_va            = (uintptr_t)data_base;
+    shm_hdr->data_size          = data_size;
+    shm_hdr->attached_processes = 1;
+
+    mi_atomic_store_release(&shm_hdr->magic, MI_CXL_SHM_MAGIC);  /* PUBLISH */
+
   } else {
     /* ------------------------------------------------------------------
-       SUBSEQUENT PROCESS: wait for init, validate, attach.
+       SUBSEQUENT PROCESS: wait, validate, attach.
        ------------------------------------------------------------------ */
     uint64_t m;
-    do {
-      m = mi_atomic_load_acquire(&shm_hdr->magic);
-    } while (m == MI_CXL_SHM_MAGIC_INIT);
- 
+    do { m = mi_atomic_load_acquire(&shm_hdr->magic); }
+    while (m == MI_CXL_SHM_MAGIC_INIT);
+
     if (mi_unlikely(m != MI_CXL_SHM_MAGIC)) {
       _mi_error_message(EINVAL,
-        "cxl-arena: unexpected magic 0x%llx — region uninitialised or corrupt\n",
+        "cxl-arena: magic 0x%llx unexpected — uninitialised or corrupt\n",
         (unsigned long long)m);
       return false;
     }
- 
-    /* Validate that both processes agree on the mapped VAs and data size.
-     * A mismatch means MAP_FIXED landed at a different address in one of
-     * the processes, which would cause silent pointer corruption.          */
     if (mi_unlikely((uintptr_t)meta_base != shm_hdr->meta_va)) {
       _mi_error_message(EINVAL,
-        "cxl-arena: meta_base VA mismatch: header=0x%zx caller=0x%zx\n"
-        "  All processes must mmap the meta region at the same address.\n",
+        "cxl-arena: meta_base VA mismatch header=0x%zx caller=0x%zx\n",
         (size_t)shm_hdr->meta_va, (size_t)(uintptr_t)meta_base);
       return false;
     }
     if (mi_unlikely((uintptr_t)data_base != shm_hdr->data_va)) {
       _mi_error_message(EINVAL,
-        "cxl-arena: data_base VA mismatch: header=0x%zx caller=0x%zx\n"
-        "  All processes must mmap the data region at the same address.\n",
+        "cxl-arena: data_base VA mismatch header=0x%zx caller=0x%zx\n",
         (size_t)shm_hdr->data_va, (size_t)(uintptr_t)data_base);
       return false;
     }
     if (mi_unlikely(data_size != shm_hdr->data_size)) {
       _mi_error_message(EINVAL,
-        "cxl-arena: data_size mismatch: header=%zu caller=%zu\n",
+        "cxl-arena: data_size mismatch header=%zu caller=%zu\n",
         shm_hdr->data_size, data_size);
       return false;
     }
- 
-    const size_t required_slot = mi_arena_id_index(arena->id);
-    if (!mi_cxl_arena_register(arena, required_slot, arena_id)) return false;
+
+    /* Reference count. */
+    const size_t prev_count = mi_atomic_add_acq_rel(
+        (_Atomic(size_t)*)&shm_hdr->attached_processes, (size_t)1);
+
+    if (prev_count == 0) {
+      _mi_memzero(&arena->blocks_inuse[0],
+                  3 * fields * sizeof(mi_bitmap_field_t));
+      arena->blocks_dirty     = &arena->blocks_inuse[fields];
+      arena->blocks_abandoned = &arena->blocks_inuse[2 * fields];
+      arena->blocks_committed = NULL;
+      arena->blocks_purge     = NULL;
+      ptrdiff_t post = (ptrdiff_t)(fields * MI_BITMAP_FIELD_BITS) - (ptrdiff_t)bcount;
+      mi_assert_internal(post >= 0);
+      if (post > 0) {
+        mi_bitmap_index_t postidx = mi_bitmap_index_create(fields - 1,
+                                        MI_BITMAP_FIELD_BITS - (size_t)post);
+        _mi_bitmap_claim(arena->blocks_inuse, fields, (size_t)post, postidx, NULL);
+      }
+    } else {
+      /* Clear stale abandoned bits to prevent reclaim of cross-process
+       * segments whose page->heap points into another process's DRAM.    */
+      for (size_t i = 0; i < arena->field_count; i++) {
+        mi_bitmap_field_t aband =
+            mi_atomic_load_acquire(&arena->blocks_abandoned[i]);
+        while (aband != 0) {
+          if (mi_atomic_cas_strong_acq_rel(&arena->blocks_abandoned[i],
+                                            &aband, (mi_bitmap_field_t)0)) {
+            mi_bitmap_field_t cur =
+                mi_atomic_load_relaxed(&arena->blocks_inuse[i]);
+            while (!mi_atomic_cas_strong_acq_rel(&arena->blocks_inuse[i],
+                                                  &cur, cur & ~aband))
+              { /* cur refreshed */ }
+            break;
+          }
+        }
+      }
+    }
+
+    /* Install the arena at the slot the first process chose.
+     * arena->id was written before magic was published so it is
+     * visible after our acquire load above.                              */
+    const size_t slot = (size_t)mi_arena_id_index(arena->id);
+    if (mi_unlikely(slot >= MI_MAX_ARENAS)) {
+      _mi_error_message(EINVAL, "cxl-arena: invalid slot %zu in shared header\n",
+                        slot);
+      mi_atomic_add_acq_rel((_Atomic(size_t)*)&shm_hdr->attached_processes,
+                          (size_t)-1);
+      return false;
+    }
+    /* Advance mi_arena_count to cover this slot if needed. */
+    size_t cur = mi_atomic_load_relaxed(&mi_arena_count);
+    while (cur <= slot) {
+      if (mi_atomic_cas_strong_acq_rel(&mi_arena_count, &cur, slot + 1)) break;
+    }
+    mi_atomic_store_ptr_release(mi_arena_t, &mi_arenas[slot], arena);
+    if (arena_id != NULL) { *arena_id = arena->id; }
+    /* Mirror what mi_arena_add does for the first process: count this arena
+     * in the local process stats so mi_stats_print shows it.               */
+    _mi_stat_counter_increase(&_mi_stats_main.arena_count, 1);
   }
- 
+
   return true;
 }
- 
+
+/* ============================================================
+   mi_cxl_detach
+   ============================================================
+   Decrement the attached_processes reference count.
+   Call before exit/munmap for every arena this process registered:
+
+     mi_heap_collect(heap, true);
+     mi_heap_delete(heap);
+     mi_cxl_detach(meta_base);
+     munmap(...);  // only after ALL mi_cxl_detach calls
+*/
+void mi_cxl_detach(void* meta_base) {
+  if (mi_unlikely(meta_base == NULL)) return;
+  mi_cxl_shm_header_t* const h = (mi_cxl_shm_header_t*)meta_base;
+  if (mi_atomic_load_acquire(&h->magic) != MI_CXL_SHM_MAGIC) return;
+  size_t cur = mi_atomic_load_relaxed((_Atomic(size_t)*)&h->attached_processes);
+  while (cur > 0) {
+    if (mi_atomic_cas_strong_acq_rel((_Atomic(size_t)*)&h->attached_processes,
+                                      &cur, cur - 1))
+      break;
+  }
+}
+
+/* ============================================================
+   mi_cxl_arena_stats / mi_cxl_arena_stats_print
+   ============================================================ */
+
+/* Count set bits across an entire bitmap array using popcount.
+ * Reads with acquire to see the latest values from all processes.          */
+static size_t mi_cxl_bitmap_popcount(const mi_bitmap_field_t* bm,
+                                      size_t field_count)
+{
+  size_t total = 0;
+  for (size_t i = 0; i < field_count; i++) {
+    mi_bitmap_field_t w = mi_atomic_load_acquire(
+        (const mi_bitmap_field_t*)&bm[i]);
+    total += (size_t)__builtin_popcountll((unsigned long long)w);
+  }
+  return total;
+}
+
+void mi_cxl_arena_stats(const void* meta_base, mi_cxl_arena_stats_t* out) {
+  if (mi_unlikely(meta_base == NULL || out == NULL)) return;
+
+  const mi_cxl_shm_header_t* const h =
+      (const mi_cxl_shm_header_t*)meta_base;
+
+  /* Validate magic before touching arena. */
+  if (mi_unlikely(mi_atomic_load_acquire(
+          (const _Atomic(uint64_t)*)&h->magic) != MI_CXL_SHM_MAGIC)) {
+    _mi_memzero(out, sizeof(*out));
+    return;
+  }
+
+  const mi_arena_t* const arena =
+      (const mi_arena_t*)((const uint8_t*)meta_base + sizeof(mi_cxl_shm_header_t));
+  const size_t fields      = arena->field_count;
+  const size_t block_count = arena->block_count;
+
+  /* Read all bitmaps.  blocks_inuse spans [0..fields-1] starting at
+   * &arena->blocks_inuse[0] — the same layout set by mi_cxl_arena_setup_bitmaps. */
+  const size_t inuse     = mi_cxl_bitmap_popcount(&arena->blocks_inuse[0], fields);
+  const size_t abandoned = (arena->blocks_abandoned != NULL)
+      ? mi_cxl_bitmap_popcount(arena->blocks_abandoned, fields) : 0;
+  const size_t dirty     = (arena->blocks_dirty != NULL)
+      ? mi_cxl_bitmap_popcount(arena->blocks_dirty, fields) : 0;
+
+  /* blocks_inuse includes phantom guard bits for the partial last word.
+   * Subtract them to get the real inuse count.                             */
+  const size_t phantom = fields * MI_BITMAP_FIELD_BITS - block_count;
+  const size_t real_inuse = (inuse >= phantom) ? (inuse - phantom) : 0;
+  const size_t free_blocks = (real_inuse <= block_count)
+      ? (block_count - real_inuse) : 0;
+
+  out->block_size         = MI_ARENA_BLOCK_SIZE;
+  out->block_count        = block_count;
+  out->blocks_inuse       = real_inuse;
+  out->blocks_abandoned   = abandoned;
+  out->blocks_dirty       = dirty;
+  out->blocks_free        = free_blocks;
+  out->attached_processes = mi_atomic_load_acquire(
+      (const _Atomic(size_t)*)&h->attached_processes);
+  out->bytes_inuse        = real_inuse  * MI_ARENA_BLOCK_SIZE;
+  out->bytes_free         = free_blocks * MI_ARENA_BLOCK_SIZE;
+}
+
+void mi_cxl_arena_stats_print(const mi_cxl_arena_stats_t* s, const char* label) {
+  if (s == NULL) return;
+  if (label == NULL) label = "cxl";
+  _mi_verbose_message(
+    "%-8s arena: block_size=%zuKiB  total=%zu  inuse=%zu  free=%zu  "
+    "abandoned=%zu  dirty=%zu  attached=%zu\n"
+    "%-8s        bytes_inuse=%zuMiB  bytes_free=%zuMiB\n",
+    label,
+    s->block_size / 1024,
+    s->block_count,
+    s->blocks_inuse,
+    s->blocks_free,
+    s->blocks_abandoned,
+    s->blocks_dirty,
+    s->attached_processes,
+    label,
+    s->bytes_inuse  / (1024 * 1024),
+    s->bytes_free   / (1024 * 1024));
+}
+
 /* ============================================================
    Public entry points
    ============================================================ */
- 
-/* Co-located: metadata and data in the same shared region. */
-bool mi_manage_os_memory_shared(void*          shm_base,
-                                 size_t         shm_size,
+
+bool mi_manage_os_memory_shared(void* shm_base, size_t shm_size,
                                  mi_arena_id_t* arena_id)
 {
   if (mi_unlikely(shm_base == NULL || shm_size == 0 || arena_id == NULL)) {
     _mi_error_message(EINVAL, "cxl-arena: invalid arguments\n");
     return false;
   }
- 
-  size_t block_count, field_count, hdr_size;
-  if (!mi_cxl_compute_layout_colocated(shm_size,
-                                        &block_count, &field_count, &hdr_size))
-  {
-    const size_t min_fc  = _mi_divide_up(2, MI_BITMAP_FIELD_BITS);
-    const size_t min_sz  = mi_cxl_header_size_colocated(min_fc)
-                         + 2 * MI_ARENA_BLOCK_SIZE;
+  size_t bcount, fields, hdr_size;
+  if (!mi_cxl_compute_layout_colocated(shm_size, &bcount, &fields, &hdr_size)) {
     _mi_error_message(EINVAL,
-      "cxl-arena: shm_size %zu is too small (minimum ~%zu bytes)\n",
-      shm_size, min_sz);
+      "cxl-arena: shm_size %zu too small (need at least 2 blocks + header)\n",
+      shm_size);
     return false;
   }
- 
-  /* For co-located: data starts immediately after the (block-aligned) header. */
-  void* const data_base = (uint8_t*)shm_base + hdr_size;
-  const size_t data_size = block_count * MI_ARENA_BLOCK_SIZE;
- 
-  return mi_cxl_init_shared(shm_base, shm_size,
-                              data_base, data_size,
-                              block_count, field_count, hdr_size,
-                              arena_id);
+  void* const  data_base = (uint8_t*)shm_base + hdr_size;
+  const size_t data_size = bcount * MI_ARENA_BLOCK_SIZE;
+  return mi_cxl_init_shared(shm_base, shm_size, data_base, data_size,
+                              bcount, fields, hdr_size, arena_id);
 }
- 
-/* Disjoint: metadata in meta_base (e.g. HWcc), data in data_base (e.g. SWcc). */
-bool mi_manage_os_memory_shared_disjoint(void*          meta_base,
-                                          size_t         meta_size,
-                                          void*          data_base,
-                                          size_t         data_size,
+
+bool mi_manage_os_memory_shared_disjoint(void* meta_base, size_t meta_size,
+                                          void* data_base, size_t data_size,
                                           mi_arena_id_t* arena_id)
 {
   if (mi_unlikely(meta_base == NULL || meta_size == 0 ||
-                  data_base == NULL || data_size == 0 || arena_id == NULL))
-  {
+                  data_base == NULL || data_size == 0 || arena_id == NULL)) {
     _mi_error_message(EINVAL, "cxl-arena: invalid arguments\n");
     return false;
   }
- 
-  size_t block_count, field_count, hdr_size;
+  size_t bcount, fields, hdr_size;
   if (!mi_cxl_compute_layout_disjoint(meta_size, data_size,
                                        (uintptr_t)data_base,
-                                       &block_count, &field_count, &hdr_size))
-  {
+                                       &bcount, &fields, &hdr_size)) {
     _mi_error_message(EINVAL,
-      "cxl-arena: meta_size %zu too small for data_size %zu\n"
-      "  Need at least %zu bytes; call mi_cxl_meta_region_size(data_size).\n",
-      meta_size, data_size,
-      mi_cxl_meta_region_size(data_size));
+      "cxl-arena: meta_size %zu too small for data_size %zu "
+      "(need %zu bytes — call mi_cxl_meta_region_size)\n",
+      meta_size, data_size, mi_cxl_meta_region_size(data_size));
     return false;
   }
- 
-  return mi_cxl_init_shared(meta_base, meta_size,
-                              data_base, data_size,
-                              block_count, field_count, hdr_size,
-                              arena_id);
+  return mi_cxl_init_shared(meta_base, meta_size, data_base, data_size,
+                              bcount, fields, hdr_size, arena_id);
 }

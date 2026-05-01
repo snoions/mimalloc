@@ -26,6 +26,7 @@
  *                     MAP_SHARED|MAP_FIXED_NOREPLACE, swcc_fd, 0);
  *
  *   // 3. Register arenas — ORDER MUST BE IDENTICAL IN EVERY PROCESS.
+ *   mi_option_set(mi_option_disallow_os_alloc, 1);
  *
  *   mi_arena_id_t hwcc_id;
  *   mi_manage_os_memory_shared(hwcc, HWCC_SIZE, &hwcc_id);
@@ -79,26 +80,26 @@
  *
  *   Purging disabled: memory is never decommitted or reset.
  */
- 
+
 #pragma once
 #ifndef MIMALLOC_CXL_H
 #define MIMALLOC_CXL_H
- 
+
 #include <mimalloc.h>
 #include <stdint.h>
 #include <stddef.h>
- 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
- 
+
 /* Magic values written into the header to signal initialisation state.
  * Atomic operations on the magic field are performed only inside arena-cxl.c
  * using mimalloc's internal atomic layer.  Callers treat this struct as
  * read-only after mi_manage_os_memory_shared*() returns.                    */
 #define MI_CXL_SHM_MAGIC_INIT  UINT64_C(0x4D494D43584C0000)  /* initialising */
 #define MI_CXL_SHM_MAGIC       UINT64_C(0x4D494D43584C0001)  /* ready        */
- 
+
 /* Shared-memory header.  Always at offset 0 of the metadata region.
  *
  * magic is read/written with acquire/release semantics inside arena-cxl.c.
@@ -113,9 +114,73 @@ typedef struct mi_cxl_shm_header_s {
   uintptr_t meta_va;             /* expected VA of meta_base (validation)     */
   uintptr_t data_va;             /* expected VA of data_base (validation)     */
   size_t   data_size;            /* size of the data region                   */
+  /* Reference count of currently-attached processes.  The first process
+   * to attach when this is 0 reinitialises the arena bitmaps, discarding
+   * stale state from previous (now-gone) processes.  Every process MUST
+   * call mi_cxl_detach() on its arena_id before exit or munmap.            */
+  volatile size_t attached_processes;
 } mi_cxl_shm_header_t;
- 
- 
+
+
+/* -------------------------------------------------------------------------
+   mi_cxl_detach
+   -------------------------------------------------------------------------
+   Decrements the attached_processes reference count and releases any
+   per-process resources held by the arena.
+
+   MUST be called by every process for every arena before exit or before
+   unmapping the CXL regions.  Safe to call from an atexit handler.
+
+   Correct shutdown sequence (per process, per arena):
+     mi_heap_collect(heap, true);
+     mi_heap_delete(heap);
+     mi_cxl_detach(meta_base);   // decrements ref count
+     munmap(...);                 // only after all mi_cxl_detach calls
+*/
+mi_decl_export void mi_cxl_detach(void* meta_base) mi_attr_noexcept;
+
+
+/* -------------------------------------------------------------------------
+   mi_cxl_arena_stats / mi_cxl_arena_stats_print
+   -------------------------------------------------------------------------
+   Read the current state of a CXL arena directly from its shared bitmaps.
+   Unlike mi_stats_print(), this reflects cross-process state — the bitmaps
+   are in shared memory and show the aggregate view across all attached
+   processes.
+
+   Usage:
+     mi_cxl_arena_stats_t s;
+     mi_cxl_arena_stats(hwcc_meta_base, &s);
+     mi_cxl_arena_stats_print(&s, "hwcc");
+
+   All counts are in arena blocks (each block = MI_ARENA_BLOCK_SIZE bytes).  */
+
+typedef struct mi_cxl_arena_stats_s {
+  size_t block_size;          /* bytes per arena block (MI_ARENA_BLOCK_SIZE)  */
+  size_t block_count;         /* total usable blocks in the arena             */
+  size_t blocks_inuse;        /* blocks currently allocated (all processes)   */
+  size_t blocks_abandoned;    /* blocks in abandoned segments                 */
+  size_t blocks_dirty;        /* blocks not yet returned to OS (always 0 for
+                                 pinned CXL memory)                           */
+  size_t blocks_free;         /* block_count - blocks_inuse                   */
+  size_t attached_processes;  /* current mi_cxl_detach reference count        */
+  size_t bytes_inuse;         /* blocks_inuse  * block_size                   */
+  size_t bytes_free;          /* blocks_free   * block_size                   */
+} mi_cxl_arena_stats_t;
+
+/* Populate *out from the shared arena bitmaps at meta_base.
+ * Safe to call from any attached process at any time.                       */
+mi_decl_export void mi_cxl_arena_stats(const void*          meta_base,
+                                        mi_cxl_arena_stats_t* out)
+  mi_attr_noexcept;
+
+/* Print a one-line summary to stderr (or the mimalloc output function).
+ * label is an optional prefix string (e.g. "hwcc", "swcc").                */
+mi_decl_export void mi_cxl_arena_stats_print(const mi_cxl_arena_stats_t* stats,
+                                              const char*                 label)
+  mi_attr_noexcept;
+
+
 /* -------------------------------------------------------------------------
    mi_cxl_meta_region_size
    -------------------------------------------------------------------------
@@ -123,8 +188,8 @@ typedef struct mi_cxl_shm_header_s {
    region of `data_size` bytes.  Use this to carve a slice from HWcc memory
    before calling mi_manage_os_memory_shared_disjoint().                     */
 mi_decl_export size_t mi_cxl_meta_region_size(size_t data_size) mi_attr_noexcept;
- 
- 
+
+
 /* -------------------------------------------------------------------------
    mi_manage_os_memory_shared
    -------------------------------------------------------------------------
@@ -135,8 +200,8 @@ mi_decl_export bool mi_manage_os_memory_shared(
     void*          shm_base,
     size_t         shm_size,
     mi_arena_id_t* arena_id) mi_attr_noexcept;
- 
- 
+
+
 /* -------------------------------------------------------------------------
    mi_manage_os_memory_shared_disjoint
    -------------------------------------------------------------------------
@@ -144,7 +209,7 @@ mi_decl_export bool mi_manage_os_memory_shared(
    regions:
      meta_base / meta_size  — holds header + bitmaps (e.g. HWcc memory)
      data_base / data_size  — holds allocation blocks (e.g. SWcc memory)
- 
+
    meta_size must be >= mi_cxl_meta_region_size(data_size).                 */
 mi_decl_export bool mi_manage_os_memory_shared_disjoint(
     void*          meta_base,
@@ -152,17 +217,17 @@ mi_decl_export bool mi_manage_os_memory_shared_disjoint(
     void*          data_base,
     size_t         data_size,
     mi_arena_id_t* arena_id) mi_attr_noexcept;
- 
- 
+
+
 /* Convenience: read-only view of the header at the base of a meta region.
    Valid only after the corresponding mi_manage_os_memory_shared*() call.    */
 static inline const mi_cxl_shm_header_t*
 mi_cxl_shm_header(const void* meta_base) {
   return (const mi_cxl_shm_header_t*)meta_base;
 }
- 
+
 #ifdef __cplusplus
 }
 #endif
- 
+
 #endif /* MIMALLOC_CXL_H */
