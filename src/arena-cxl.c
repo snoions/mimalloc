@@ -4,7 +4,7 @@
  *
  * MUST be #include-d from the BOTTOM of src/arena.c (after all static
  * function definitions), not compiled as a separate translation unit.
-
+ *
  * ============================================================
  * Shared-memory layout (both co-located and disjoint)
  * ============================================================
@@ -64,6 +64,39 @@ static size_t mi_cxl_header_size_colocated(size_t fields) {
 
 static size_t mi_cxl_header_size_disjoint(size_t fields) {
   return sizeof(mi_cxl_shm_header_t) + mi_cxl_arena_meta_size(fields);
+}
+
+/* ============================================================
+   Canonical bitmap setup — mirrors mi_manage_os_memory_ex2 exactly
+   ============================================================ */
+
+/* Set bitmap pointers and claim phantom bits in a freshly zeroed arena.
+ * Called both from first-init and from the no-live-peers reinit path.
+ *
+ * Canonical layout (from mi_manage_os_memory_ex2):
+ *   arena->blocks_dirty     = &arena->blocks_inuse[fields]
+ *   arena->blocks_abandoned = &arena->blocks_inuse[2 * fields]
+ *   arena->blocks_committed = NULL   (pinned)
+ *   arena->blocks_purge     = NULL   (pinned)
+ */
+static void mi_cxl_arena_setup_bitmaps(mi_arena_t* arena, size_t block_count,
+                                        size_t fields)
+{
+  arena->blocks_dirty     = &arena->blocks_inuse[fields];
+  arena->blocks_abandoned = &arena->blocks_inuse[2 * fields];
+  arena->blocks_committed = NULL;  /* pinned: always committed, no tracking */
+  arena->blocks_purge     = NULL;  /* pinned: never purged                  */
+
+  /* Claim phantom bits [block_count .. fields*MI_BITMAP_FIELD_BITS - 1]
+   * so the allocator never hands out addresses past the end of the region.
+   * Identical to the post-block clamping in mi_manage_os_memory_ex2.      */
+  ptrdiff_t post = (ptrdiff_t)(fields * MI_BITMAP_FIELD_BITS) - (ptrdiff_t)block_count;
+  mi_assert_internal(post >= 0);
+  if (post > 0) {
+    mi_bitmap_index_t postidx = mi_bitmap_index_create(fields - 1,
+                                    MI_BITMAP_FIELD_BITS - (size_t)post);
+    _mi_bitmap_claim(arena->blocks_inuse, fields, (size_t)post, postidx, NULL);
+  }
 }
 
 /* ============================================================
@@ -139,9 +172,61 @@ static bool mi_cxl_compute_layout_disjoint(size_t    meta_size,
   return true;
 }
 
-/* ============================================================
-   Shared internal implementation
-   ============================================================ */
+/* Walk every in-use page in a segment and null out xheap.
+ *
+ * When we clear blocks_inuse bits for a segment on attach, the segment's
+ * page headers (in CXL shared memory) still contain xheap values pointing
+ * into the previous process's local DRAM.  If the allocator hands out a
+ * block from that segment, mi_page_heap() will return a stale cross-process
+ * address, and any code that dereferences heap->pages (e.g. mi_page_to_full,
+ * mi_page_queue_enqueue_from_ex) will crash.
+ *
+ * We null xheap here so the segment looks freshly allocated to the next
+ * process.  mi_segment_reclaim / mi_page_fresh will set xheap correctly when
+ * the page is next handed to a heap.
+ *
+ * Uses only the public slice iterator pattern from segment.c; safe to call
+ * inside MI_IN_ARENA_C.                                                     */
+static void mi_cxl_reset_segment_xheap(mi_segment_t* seg) {
+  const size_t nslices = seg->slice_entries;
+  mi_slice_t*  slices  = seg->slices;
+  size_t i = 0;
+  while (i < nslices) {
+    mi_slice_t* slice = &slices[i];
+    if (slice->slice_count == 0) break;
+    /* A slice is "used" (i.e. is a page, not a free span) when block_size > 0.
+     * Inlined here because mi_slice_is_used is defined later in segment.c.  */
+    if (slice->block_size > 0) {
+      mi_page_t* page = (mi_page_t*)slice;
+      mi_atomic_store_release(&page->xheap, (uintptr_t)0);
+    }
+    i += slice->slice_count;
+  }
+}
+
+/* Clear xheap for every segment whose block was freed in a bitmap word.
+ * abandoned_mask: the bits that were just cleared from blocks_inuse.
+ * field_idx:      which 64-bit word they came from.                         */
+static void mi_cxl_reset_xheap_for_mask(const mi_arena_t*  arena,
+                                          size_t             field_idx,
+                                          mi_bitmap_field_t  freed_mask)
+{
+  /* Iterate set bits of freed_mask.  Each set bit b in field word f
+   * corresponds to block index f*MI_BITMAP_FIELD_BITS + b, and since
+   * MI_ARENA_BLOCK_SIZE == MI_SEGMENT_SIZE, that block IS one segment.      */
+  while (freed_mask != 0) {
+    /* Isolate lowest set bit. */
+    const mi_bitmap_field_t lsb = freed_mask & (~freed_mask + 1);
+    freed_mask &= ~lsb;
+    /* __builtin_ctzll is available everywhere we care about.               */
+    const size_t bit      = (size_t)__builtin_ctzll((unsigned long long)lsb);
+    const size_t block_idx = field_idx * MI_BITMAP_FIELD_BITS + bit;
+    if (block_idx >= arena->block_count) continue;  /* phantom guard bit    */
+    mi_segment_t* seg =
+        (mi_segment_t*)(arena->start + block_idx * MI_ARENA_BLOCK_SIZE);
+    mi_cxl_reset_segment_xheap(seg);
+  }
+}
 
 static bool mi_cxl_init_shared(void*  meta_base, size_t meta_size,
                                 void*  data_base, size_t data_size,
@@ -194,17 +279,7 @@ static bool mi_cxl_init_shared(void*  meta_base, size_t meta_size,
     arena->search_idx   = 0;
     mi_lock_init(&arena->abandoned_visit_lock);
 
-    arena->blocks_dirty     = &arena->blocks_inuse[fields];
-    arena->blocks_abandoned = &arena->blocks_inuse[2 * fields];
-    arena->blocks_committed = NULL;  /* pinned: always committed, no tracking */
-    arena->blocks_purge     = NULL;  /* pinned: never purged                  */
-    ptrdiff_t post = (ptrdiff_t)(fields * MI_BITMAP_FIELD_BITS) - (ptrdiff_t)bcount;
-    mi_assert_internal(post >= 0);
-    if (post > 0) {
-      mi_bitmap_index_t postidx = mi_bitmap_index_create(fields - 1,
-                                      MI_BITMAP_FIELD_BITS - (size_t)post);
-      _mi_bitmap_claim(arena->blocks_inuse, fields, (size_t)post, postidx, NULL);
-    }
+    mi_cxl_arena_setup_bitmaps(arena, bcount, fields);
 
     /* Use mi_arena_add — same function the canonical path calls.
      * It atomically claims a slot, sets arena->id, updates stats,
@@ -260,39 +335,44 @@ static bool mi_cxl_init_shared(void*  meta_base, size_t meta_size,
     }
 
     /* Reference count. */
-    const size_t prev_count = mi_atomic_add_acq_rel(
-        (_Atomic(size_t)*)&shm_hdr->attached_processes, (size_t)1);
+    const size_t prev_count = (size_t)atomic_fetch_add_explicit(
+        (_Atomic(size_t)*)&shm_hdr->attached_processes,
+        (size_t)1, memory_order_acq_rel);
 
     if (prev_count == 0) {
+      /* No live peers — safe to reset everything.
+       * Reset xheap for all inuse segments BEFORE zeroing bitmaps so the
+       * allocator cannot hand out a segment that still has a stale xheap. */
+      for (size_t i = 0; i < fields; i++) {
+        mi_bitmap_field_t was_inuse =
+            mi_atomic_load_relaxed(&arena->blocks_inuse[i]);
+        if (was_inuse != 0)
+          mi_cxl_reset_xheap_for_mask(arena, i, was_inuse);
+      }
       _mi_memzero(&arena->blocks_inuse[0],
                   3 * fields * sizeof(mi_bitmap_field_t));
-      arena->blocks_dirty     = &arena->blocks_inuse[fields];
-      arena->blocks_abandoned = &arena->blocks_inuse[2 * fields];
-      arena->blocks_committed = NULL;
-      arena->blocks_purge     = NULL;
-      ptrdiff_t post = (ptrdiff_t)(fields * MI_BITMAP_FIELD_BITS) - (ptrdiff_t)bcount;
-      mi_assert_internal(post >= 0);
-      if (post > 0) {
-        mi_bitmap_index_t postidx = mi_bitmap_index_create(fields - 1,
-                                        MI_BITMAP_FIELD_BITS - (size_t)post);
-        _mi_bitmap_claim(arena->blocks_inuse, fields, (size_t)post, postidx, NULL);
-      }
+      mi_cxl_arena_setup_bitmaps(arena, bcount, fields);
     } else {
-      /* Clear stale abandoned bits to prevent reclaim of cross-process
-       * segments whose page->heap points into another process's DRAM.    */
-      for (size_t i = 0; i < arena->field_count; i++) {
+      /* Live peers exist.  Only reclaim blocks that are both abandoned
+       * AND inuse — those belong to threads that exited without draining.
+       *
+       * NEVER touch inuse blocks that are not also abandoned: those belong
+       * to live peers and resetting their xheap would race with those peers
+       * actively reading xheap in mi_page_to_full and related functions.   */
+      for (size_t i = 0; i < fields; i++) {
         mi_bitmap_field_t aband =
             mi_atomic_load_acquire(&arena->blocks_abandoned[i]);
-        while (aband != 0) {
-          if (mi_atomic_cas_strong_acq_rel(&arena->blocks_abandoned[i],
-                                            &aband, (mi_bitmap_field_t)0)) {
-            mi_bitmap_field_t cur =
-                mi_atomic_load_relaxed(&arena->blocks_inuse[i]);
-            while (!mi_atomic_cas_strong_acq_rel(&arena->blocks_inuse[i],
-                                                  &cur, cur & ~aband))
-              { /* cur refreshed */ }
-            break;
-          }
+        if (aband == 0) continue;
+        if (mi_atomic_cas_strong_acq_rel(&arena->blocks_abandoned[i],
+                                          &aband, (mi_bitmap_field_t)0)) {
+          /* Reset xheap BEFORE freeing inuse bits so the allocator cannot
+           * claim the block while it still has a stale heap pointer.       */
+          mi_cxl_reset_xheap_for_mask(arena, i, aband);
+          mi_bitmap_field_t cur =
+              mi_atomic_load_relaxed(&arena->blocks_inuse[i]);
+          while (!mi_atomic_cas_strong_acq_rel(&arena->blocks_inuse[i],
+                                                &cur, cur & ~aband))
+            { /* cur refreshed */ }
         }
       }
     }
@@ -304,8 +384,8 @@ static bool mi_cxl_init_shared(void*  meta_base, size_t meta_size,
     if (mi_unlikely(slot >= MI_MAX_ARENAS)) {
       _mi_error_message(EINVAL, "cxl-arena: invalid slot %zu in shared header\n",
                         slot);
-      mi_atomic_add_acq_rel((_Atomic(size_t)*)&shm_hdr->attached_processes,
-                          (size_t)-1);
+      atomic_fetch_add_explicit((_Atomic(size_t)*)&shm_hdr->attached_processes,
+                                 (size_t)-1, memory_order_acq_rel);
       return false;
     }
     /* Advance mi_arena_count to cover this slot if needed. */
@@ -338,10 +418,13 @@ void mi_cxl_detach(void* meta_base) {
   if (mi_unlikely(meta_base == NULL)) return;
   mi_cxl_shm_header_t* const h = (mi_cxl_shm_header_t*)meta_base;
   if (mi_atomic_load_acquire(&h->magic) != MI_CXL_SHM_MAGIC) return;
-  size_t cur = mi_atomic_load_relaxed((_Atomic(size_t)*)&h->attached_processes);
+  size_t cur = (size_t)atomic_load_explicit(
+      (_Atomic(size_t)*)&h->attached_processes, memory_order_relaxed);
   while (cur > 0) {
-    if (mi_atomic_cas_strong_acq_rel((_Atomic(size_t)*)&h->attached_processes,
-                                      &cur, cur - 1))
+    if (atomic_compare_exchange_strong_explicit(
+            (_Atomic(size_t)*)&h->attached_processes,
+            &cur, cur - 1,
+            memory_order_acq_rel, memory_order_relaxed))
       break;
   }
 }
@@ -357,8 +440,9 @@ static size_t mi_cxl_bitmap_popcount(const mi_bitmap_field_t* bm,
 {
   size_t total = 0;
   for (size_t i = 0; i < field_count; i++) {
+    /* Cast away const: _Atomic cannot be applied to a const-qualified type. */
     mi_bitmap_field_t w = mi_atomic_load_acquire(
-        (const mi_bitmap_field_t*)&bm[i]);
+        (mi_bitmap_field_t*)&bm[i]);
     total += (size_t)__builtin_popcountll((unsigned long long)w);
   }
   return total;
@@ -372,7 +456,7 @@ void mi_cxl_arena_stats(const void* meta_base, mi_cxl_arena_stats_t* out) {
 
   /* Validate magic before touching arena. */
   if (mi_unlikely(mi_atomic_load_acquire(
-          (const _Atomic(uint64_t)*)&h->magic) != MI_CXL_SHM_MAGIC)) {
+          (_Atomic(uint64_t)*)&h->magic) != MI_CXL_SHM_MAGIC)) {
     _mi_memzero(out, sizeof(*out));
     return;
   }
@@ -384,7 +468,8 @@ void mi_cxl_arena_stats(const void* meta_base, mi_cxl_arena_stats_t* out) {
 
   /* Read all bitmaps.  blocks_inuse spans [0..fields-1] starting at
    * &arena->blocks_inuse[0] — the same layout set by mi_cxl_arena_setup_bitmaps. */
-  const size_t inuse     = mi_cxl_bitmap_popcount(&arena->blocks_inuse[0], fields);
+  const size_t inuse     = mi_cxl_bitmap_popcount(
+      (mi_bitmap_field_t*)&arena->blocks_inuse[0], fields);
   const size_t abandoned = (arena->blocks_abandoned != NULL)
       ? mi_cxl_bitmap_popcount(arena->blocks_abandoned, fields) : 0;
   const size_t dirty     = (arena->blocks_dirty != NULL)
@@ -403,8 +488,8 @@ void mi_cxl_arena_stats(const void* meta_base, mi_cxl_arena_stats_t* out) {
   out->blocks_abandoned   = abandoned;
   out->blocks_dirty       = dirty;
   out->blocks_free        = free_blocks;
-  out->attached_processes = mi_atomic_load_acquire(
-      (const _Atomic(size_t)*)&h->attached_processes);
+  out->attached_processes = (size_t)atomic_load_explicit(
+      (_Atomic(size_t)*)&h->attached_processes, memory_order_acquire);
   out->bytes_inuse        = real_inuse  * MI_ARENA_BLOCK_SIZE;
   out->bytes_free         = free_blocks * MI_ARENA_BLOCK_SIZE;
 }
