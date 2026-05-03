@@ -10,6 +10,8 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
+#include <pthread.h> // pthread_atfork
+#include <unistd.h> // getpid() TODO: cross-platform support
 
 
 // Empty page used to initialize the small free pages array
@@ -180,6 +182,8 @@ mi_decl_cache_align mi_heap_t _mi_heap_main = {
 };
 
 bool _mi_process_is_initialized = false;  // set to `true` in `mi_process_init`.
+
+mi_decl_hidden uintptr_t _mi_process_id = 0; // set to process id in `mi_process_init`
 
 mi_stats_t _mi_stats_main = { sizeof(mi_stats_t), MI_STAT_VERSION, MI_STATS_NULL };
 
@@ -621,6 +625,10 @@ static void mi_detect_cpu_features(void) {
 }
 #endif
 
+static void mi_child_process_init(void) {
+  _mi_process_id = (uintptr_t)getpid();
+}
+
 // Initialize the process; called by thread_init or the process loader
 void mi_process_init(void) mi_attr_noexcept {
   // ensure we are called once
@@ -630,6 +638,8 @@ void mi_process_init(void) mi_attr_noexcept {
 	#endif
   if (!mi_atomic_once(&process_init)) return;
   _mi_process_is_initialized = true;
+  pthread_atfork(NULL, NULL, mi_child_process_init);
+  _mi_process_id = (uintptr_t)getpid();
   _mi_verbose_message("process init: 0x%zx\n", _mi_thread_id());
   mi_process_setup_auto_thread_done();
 

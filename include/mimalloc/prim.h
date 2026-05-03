@@ -273,6 +273,7 @@ static inline void mi_prim_tls_slot_set(size_t slot, void* value) mi_attr_noexce
 // defined in `init.c`; do not use these directly
 extern mi_decl_hidden mi_decl_thread mi_heap_t* _mi_heap_default;  // default heap to allocate from
 extern mi_decl_hidden bool _mi_process_is_initialized;             // has mi_process_init been called?
+extern mi_decl_hidden uintptr_t _mi_process_id;
 
 static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept;
 
@@ -280,21 +281,21 @@ static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept;
 #if defined(MI_PRIM_THREAD_ID)
 
 static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
-  return MI_PRIM_THREAD_ID();  // used for example by CPython for a free threaded build (see python/cpython#115488)
+  return MI_PRIM_THREAD_ID() ^ (_mi_process_id * 0x9e3779b97f4a7c15ULL);  // used for example by CPython for a free threaded build (see python/cpython#115488)
 }
 
 #elif defined(_WIN32)
 
 static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
   // Windows: works on Intel and ARM in both 32- and 64-bit
-  return (uintptr_t)NtCurrentTeb();
+  return (uintptr_t)NtCurrentTeb() ^ (_mi_process_id * 0x9e3779b97f4a7c15ULL);
 }
 
 #elif MI_USE_BUILTIN_THREAD_POINTER
 
 static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
   // Works on most Unix based platforms with recent compilers
-  return (uintptr_t)__builtin_thread_pointer();
+  return (uintptr_t)__builtin_thread_pointer() ^ (_mi_process_id * 0x9e3779b97f4a7c15ULL);
 }
 
 #elif MI_HAS_TLS_SLOT
@@ -303,12 +304,12 @@ static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
   #if defined(__BIONIC__)
     // issue #384, #495: on the Bionic libc (Android), slot 1 is the thread id
     // see: https://github.com/aosp-mirror/platform_bionic/blob/c44b1d0676ded732df4b3b21c5f798eacae93228/libc/platform/bionic/tls_defines.h#L86
-    return (uintptr_t)mi_prim_tls_slot(1);
+    return (uintptr_t)mi_prim_tls_slot(1) ^ (_mi_process_id * 0x9e3779b97f4a7c15ULL);
   #else
     // in all our other targets, slot 0 is the thread id
     // glibc: https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=sysdeps/x86_64/nptl/tls.h
     // apple: https://github.com/apple/darwin-xnu/blob/main/libsyscall/os/tsd.h#L36
-    return (uintptr_t)mi_prim_tls_slot(0);
+    return (uintptr_t)mi_prim_tls_slot(0) ^ (_mi_process_id * 0x9e3779b97f4a7c15ULL);
   #endif
 }
 
@@ -316,7 +317,7 @@ static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
 
 // otherwise use portable C, taking the address of a thread local variable (this is still very fast on most platforms).
 static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
-  return (uintptr_t)&_mi_heap_default;
+  return (uintptr_t)&_mi_heap_default ^ (_mi_process_id * 0x9e3779b97f4a7c15ULL);
 }
 
 #endif
