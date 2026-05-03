@@ -261,6 +261,16 @@ static void mi_decl_noinline mi_free_block_delayed_mt( mi_page_t* page, mi_block
 // Multi-threaded free (`_mt`) (or free in huge block if compiled with MI_HUGE_PAGE_ABANDON)
 static void mi_decl_noinline mi_free_block_mt(mi_page_t* page, mi_segment_t* segment, mi_block_t* block)
 {
+  if (mi_unlikely(segment->memid.is_pinned)) {
+    mi_thread_free_t tfree;
+    mi_thread_free_t tfreex;
+    do {
+      tfree  = mi_atomic_load_relaxed(&page->xthread_free);
+      mi_block_set_next(page, block, mi_tf_block(tfree));
+      tfreex = mi_tf_set_block(tfree, block);
+    } while (!mi_atomic_cas_weak_release(&page->xthread_free, &tfree, tfreex));
+    return;
+  }
   // first see if the segment was abandoned and if we can reclaim it into our thread
   if (_mi_option_get_fast(mi_option_abandoned_reclaim_on_free) != 0 &&
       #if MI_HUGE_PAGE_ABANDON
